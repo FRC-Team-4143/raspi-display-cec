@@ -45,15 +45,6 @@ import yaml
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-# Optional systemd journal handler (if python-systemd is installed)
-try:
-    from systemd.journal import JournaldLogHandler  # type: ignore
-except Exception:
-    JournaldLogHandler = None  # type: ignore
-
-# SysLogHandler is in the stdlib; used as a fallback
-from logging.handlers import SysLogHandler
-
 LOG = logging.getLogger("cec_scheduler")
 
 
@@ -188,23 +179,8 @@ def main():
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.loglevel.upper(), logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
 
-    # Also attach a Journal or SysLog handler so logs appear in `journalctl` reliably
-    try:
-        if JournaldLogHandler is not None:
-            jh = JournaldLogHandler()
-            jh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-            logging.getLogger().addHandler(jh)
-            LOG.debug("Attached JournaldLogHandler for systemd journal logging")
-        else:
-            raise RuntimeError("JournaldLogHandler not available")
-    except Exception:
-        try:
-            sh = SysLogHandler(address="/dev/log")
-            sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-            logging.getLogger().addHandler(sh)
-            LOG.debug("Attached SysLogHandler (/dev/log) for system logging")
-        except Exception:
-            LOG.debug("No systemd journal or syslog available; using default logging handlers")
+    # When run under systemd, stdout/stderr is already captured into the journal,
+    # so no extra journal/syslog handler is attached (doing so double-logs lines).
 
     cfg = load_config(args.config)
 
