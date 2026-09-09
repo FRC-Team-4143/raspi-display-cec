@@ -15,5 +15,4 @@
 # drop the ATTRS{...} clauses (the script already filters non-capture nodes).
 
 ACTION=="add", SUBSYSTEM=="video4linux", KERNEL=="video[0-9]*", \
-  ATTRS{idVendor}=="046d", ATTRS{idProduct}=="0825", \
   RUN+="/usr/local/bin/camera-setup.sh /dev/%k"
