@@ -1,0 +1,19 @@
+# 99-camera-setup.rules - run camera-setup.sh when the camera appears.
+#
+# Install:
+#   sudo cp camera-setup.sh /usr/local/bin/
+#   sudo cp 99-camera-setup.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload
+#   sudo udevadm trigger --subsystem-match=video4linux --action=add
+#
+# Find the match attributes for your camera with:
+#   udevadm info -a -n /dev/video0
+#
+# Below matches a specific USB camera by vendor/product. For a CSI / Pi
+# camera match on the driver instead, e.g.:  ATTR{name}=="unicam", or
+# ENV{ID_V4L_PRODUCT}=="...". To match ANY video4linux capture device,
+# drop the ATTRS{...} clauses (the script already filters non-capture nodes).
+
+ACTION=="add", SUBSYSTEM=="video4linux", KERNEL=="video[0-9]*", \
+  ATTRS{idVendor}=="046d", ATTRS{idProduct}=="0825", \
+  RUN+="/usr/local/bin/camera-setup.sh /dev/%k"
