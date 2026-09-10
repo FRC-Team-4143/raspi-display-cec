@@ -38,9 +38,10 @@ Top-level options:
     it has powered down its CEC controller and is offline. Set false to always
     send commands.
 
-Note: cec-client is run WITHOUT ``-s`` and given a few seconds to initialize
-before each command, so wake commands still work after the TV has dropped off
-the CEC bus.
+Note: each scheduled job runs a single cec-client process (not ``-s`` mode, and
+not one process per command) and waits a few seconds for it to initialize before
+transmitting, so wake commands still work after the TV has dropped off the bus
+and back-to-back invocations don't fight over the adapter.
 
 """
 
@@ -51,6 +52,7 @@ import logging
 import signal
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -89,27 +91,71 @@ def parse_time(t: str) -> tuple[int, int, int]:
     return h, m, s
 
 
-def run_cec_client(
+def _drain(stream, sink: List[str]) -> None:
+    """Read a subprocess stream line-by-line into ``sink`` until EOF."""
+    try:
+        for line in stream:
+            sink.append(line)
+    except (ValueError, OSError):
+        pass
+
+
+def parse_power_state(text: str) -> str:
+    """Parse cec-client output into 'on' / 'standby' / 'transition' / 'unknown'.
+
+    'unknown' means the TV never answered the ``pow`` query -- typically because
+    it has powered down its HDMI-CEC controller and is effectively offline.
+    """
+    state = "unknown"
+    for line in text.lower().splitlines():
+        line = line.strip()
+        if "power status:" not in line:
+            continue
+        val = line.split("power status:", 1)[1].strip()
+        if "transition" in val:
+            state = "transition"
+        elif val.startswith("on"):
+            state = "on"
+        elif val.startswith("standby"):
+            state = "standby"
+        else:
+            state = "unknown"
+    return state
+
+
+def run_cec_job(
     cec_client_path: str,
-    stdin_text: str,
+    commands: List[str],
+    device: str,
+    *,
+    inter_delay: float,
+    retries: int,
+    retry_delay: float,
+    power_check: bool,
     dry_run: bool = False,
     init_wait: float = 4.0,
     settle_wait: float = 3.0,
-) -> tuple[int, str, str]:
-    """Runs cec-client with the provided stdin and returns (returncode, stdout, stderr).
+) -> None:
+    """Run one long-lived cec-client process and feed it every command for a job.
 
-    Deliberately does NOT use ``-s`` (single-command) mode: after the TV has been
-    in deep standby for a few minutes, the CEC adapter needs time to re-power,
-    poll the bus and register a logical address. ``-s`` transmits before that
-    handshake finishes, so wake commands silently get dropped. Instead we start
-    cec-client normally, wait ``init_wait`` seconds for it to initialize, send the
-    command, wait ``settle_wait`` for it to be transmitted, then close stdin so
-    cec-client exits.
+    Using a single process (rather than one per command) avoids two problems:
+      * cec-client can only hold the CEC adapter open one process at a time, so
+        back-to-back invocations race and the later one exits before it can
+        transmit (this is what produced the "I/O operation on closed file" crash);
+      * it does NOT use ``-s`` (single-command) mode, so the adapter gets time to
+        re-power, poll the bus and allocate a logical address before we transmit
+        -- otherwise wake commands sent to a TV that dropped off the bus are lost.
+
+    We wait ``init_wait`` for that handshake, then write commands (with retries and
+    ``inter_delay`` between them) holding stdin open, then wait ``settle_wait`` for
+    the last frame to go out before closing stdin so cec-client exits.
     """
-    LOG.debug("Will run cec-client: %s; stdin: %s", cec_client_path, stdin_text.strip())
     if dry_run:
-        print(f"DRY-RUN: {cec_client_path} -d 1 <<< {stdin_text!r}")
-        return 0, "", ""
+        if power_check:
+            print(f"DRY-RUN: {cec_client_path} -d 1 <<< 'pow {device}'")
+        for cmd in commands:
+            print(f"DRY-RUN: {cec_client_path} -d 1 <<< {build_stdin_for_command(cmd, device)!r}")
+        return
 
     try:
         p = subprocess.Popen(
@@ -121,66 +167,101 @@ def run_cec_client(
         )
     except FileNotFoundError:
         LOG.error("cec-client not found at %s", cec_client_path)
-        return 127, "", ""
+        return
+
+    out_lines: List[str] = []
+    err_lines: List[str] = []
+    t_out = threading.Thread(target=_drain, args=(p.stdout, out_lines), daemon=True)
+    t_err = threading.Thread(target=_drain, args=(p.stderr, err_lines), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    def send(line: str) -> bool:
+        if not line.endswith("\n"):
+            line += "\n"
+        try:
+            assert p.stdin is not None
+            p.stdin.write(line)
+            p.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            LOG.warning("cec-client input pipe closed (%s); it likely exited early", exc)
+            return False
 
     try:
-        time.sleep(init_wait)
-        assert p.stdin is not None
-        p.stdin.write(stdin_text)
-        p.stdin.flush()
-        time.sleep(settle_wait)
-        p.stdin.close()
-        stdout, stderr = p.communicate(timeout=15)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        stdout, stderr = p.communicate()
-    except Exception:
-        p.kill()
-        p.communicate()
-        raise
+        time.sleep(init_wait)  # bus scan + logical-address allocation
 
-    stdout = stdout or ""
-    stderr = stderr or ""
-    LOG.debug("cec-client exited: %s", p.returncode)
-    if stdout.strip():
-        LOG.debug("cec-client stdout: %s", stdout.strip())
-    if stderr.strip():
-        LOG.debug("cec-client stderr: %s", stderr.strip())
-    return p.returncode, stdout, stderr
+        if p.poll() is not None:
+            LOG.error(
+                "cec-client exited early (rc=%s) before any command was sent: %s",
+                p.returncode, ("".join(err_lines) or "".join(out_lines)).strip(),
+            )
+            return
 
+        if power_check:
+            state = "unknown"
+            for probe in range(2):  # a single 'pow' can be missed; try twice
+                del out_lines[:]
+                if not send(f"pow {device}"):
+                    break
+                time.sleep(3.0)
+                state = parse_power_state("".join(out_lines) + "".join(err_lines))
+                if state != "unknown":
+                    break
+                LOG.debug("power state query returned 'unknown' (probe %d/2)", probe + 1)
+            if state == "unknown":
+                LOG.error(
+                    "TV at device %s did not report a power state -- it appears to have "
+                    "gone offline (its HDMI-CEC controller has powered down). Skipping "
+                    "these commands. Fix: disable the TV's deep sleep / eco / low-power "
+                    "standby settings so it keeps CEC alive (see README). Set "
+                    "'power_check: false' in the config to send commands anyway.",
+                    device,
+                )
+                return
+            LOG.info("TV power state: %s", state)
 
-def query_power_state(cec_client_path: str, device: str, retries: int = 1, retry_delay: float = 5.0) -> str:
-    """Ask the TV for its CEC power state.
+        attempts = retries + 1
+        for i, cmd in enumerate(commands):
+            line = build_stdin_for_command(cmd, device)
+            for attempt in range(1, attempts + 1):
+                if p.poll() is not None:
+                    LOG.warning(
+                        "cec-client exited early (rc=%s); aborting remaining commands", p.returncode
+                    )
+                    return
+                LOG.info("Command %d/%d: %s (attempt %d/%d)", i + 1, len(commands), cmd, attempt, attempts)
+                if not send(line):
+                    return
+                if attempt < attempts and retry_delay > 0:
+                    LOG.debug("Sleeping %.2fs before retry", retry_delay)
+                    time.sleep(retry_delay)
 
-    Returns one of: ``"on"``, ``"standby"``, ``"transition"`` (powering up/down)
-    or ``"unknown"``. ``"unknown"`` means the device never answered the ``pow``
-    query -- typically because the TV has powered down its HDMI-CEC controller
-    and is effectively offline to CEC.
-    """
-    attempts = max(1, retries + 1)
-    state = "unknown"
-    for attempt in range(1, attempts + 1):
-        rc, out, err = run_cec_client(cec_client_path, f"pow {device}\n", dry_run=False)
-        text = f"{out}\n{err}".lower()
-        for line in text.splitlines():
-            line = line.strip()
-            if "power status:" not in line:
-                continue
-            val = line.split("power status:", 1)[1].strip()
-            if val.startswith("on"):
-                state = "on"
-            elif "standby" in val:
-                state = "standby"
-            elif "transition" in val:
-                state = "transition"
-            else:
-                state = "unknown"
-        if state != "unknown":
-            return state
-        LOG.debug("Power state query returned 'unknown' (attempt %d/%d)", attempt, attempts)
-        if attempt < attempts and retry_delay > 0:
-            time.sleep(retry_delay)
-    return state
+            if i < len(commands) - 1 and inter_delay > 0:
+                LOG.debug("Sleeping %.2fs before next command", inter_delay)
+                time.sleep(inter_delay)
+
+        time.sleep(settle_wait)  # let the final frame be transmitted
+    finally:
+        try:
+            if p.stdin is not None and not p.stdin.closed:
+                p.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        try:
+            p.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+        t_out.join(timeout=2)
+        t_err.join(timeout=2)
+        combined_out = "".join(out_lines).strip()
+        combined_err = "".join(err_lines).strip()
+        LOG.debug("cec-client exited: %s", p.returncode)
+        if combined_out:
+            LOG.debug("cec-client stdout: %s", combined_out)
+        if combined_err:
+            LOG.debug("cec-client stderr: %s", combined_err)
 
 
 def build_stdin_for_command(cmd: str, device: str) -> str:
@@ -242,42 +323,21 @@ def schedule_commands(scheduler: BackgroundScheduler, cfg: Dict[str, Any], dry_r
         def job_wrapper(sc=sc, device=device, cec_client_path=cec_client_path, dry_run=dry_run,
                         item_delay=item_delay, power_check=power_check):
             LOG.info("Executing scheduled job '%s' at %s (commands=%s)", sc.name, datetime.now().astimezone(), sc.commands)
-
-            if power_check and not dry_run:
-                state = query_power_state(cec_client_path, device)
-                if state == "unknown":
-                    LOG.error(
-                        "TV at device %s did not report a power state -- it appears to have "
-                        "gone offline (its HDMI-CEC controller has powered down). Skipping job "
-                        "'%s'. Fix: disable the TV's deep sleep / eco / low-power standby "
-                        "settings so it keeps CEC alive (see README). Set 'power_check: false' "
-                        "in the config to send commands anyway.",
-                        device, sc.name,
-                    )
-                    return
-                LOG.info("TV power state before job '%s': %s", sc.name, state)
-
-            attempts = sc.retries + 1
-            for i, cmd in enumerate(sc.commands):
-                stdin = build_stdin_for_command(cmd, device)
-                for attempt in range(1, attempts + 1):
-                    LOG.info("Command %d/%d: %s (attempt %d/%d)", i + 1, len(sc.commands), cmd, attempt, attempts)
-                    rc, out, err = run_cec_client(cec_client_path, stdin, dry_run=dry_run)
-                    if rc == 0:
-                        LOG.info("Command '%s' triggered successfully for device %s at %s", cmd, device, datetime.now().astimezone())
-                        if out.strip():
-                            LOG.info("Command output: %s", out.strip())
-                    else:
-                        LOG.warning("Command '%s' returned non-zero exit status %s; stderr: %s", cmd, rc, err.strip())
-
-                    if attempt < attempts and sc.retry_delay > 0:
-                        LOG.debug("Sleeping %.2fs before retry", sc.retry_delay)
-                        time.sleep(sc.retry_delay)
-
-                # Delay before the next command if applicable
-                if i < len(sc.commands) - 1 and item_delay > 0:
-                    LOG.debug("Sleeping %.2fs before next command", item_delay)
-                    time.sleep(item_delay)
+            try:
+                run_cec_job(
+                    cec_client_path,
+                    sc.commands,
+                    device,
+                    inter_delay=item_delay,
+                    retries=sc.retries,
+                    retry_delay=sc.retry_delay,
+                    power_check=power_check,
+                    dry_run=dry_run,
+                )
+            except Exception:
+                LOG.exception("Scheduled job '%s' failed", sc.name)
+            else:
+                LOG.info("Finished scheduled job '%s' at %s", sc.name, datetime.now().astimezone())
 
         scheduler.add_job(job_wrapper, trigger=trigger, id=f"job-{idx}", name=sc.name)
         LOG.info("Scheduled '%s' at %s (days: %s) commands: %s", sc.name, sc.time, sc.days or 'everyday', sc.commands)
