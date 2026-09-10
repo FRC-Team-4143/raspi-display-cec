@@ -26,6 +26,13 @@ Fields:
   - time: "HH:MM" or "HH:MM:SS"
   - command: string (e.g. on, standby, tx 44:41:...)
   - days: optional list of days (mon,tue,...,sun). If omitted, runs every day.
+  - retries: optional int, extra times to re-send each command (default 0).
+    Useful for waking a TV that has been in deep standby for a while.
+  - retry_delay: optional float, seconds between attempts (default 10).
+
+Note: cec-client is run WITHOUT ``-s`` and given a few seconds to initialize
+before each command, so wake commands still work after the TV has dropped off
+the CEC bus.
 
 """
 
@@ -54,6 +61,8 @@ class ScheduledCommand:
     commands: List[str]
     days: Optional[List[str]] = None
     name: Optional[str] = None
+    retries: int = 0  # extra times to re-send each command (helps wake a TV in deep standby)
+    retry_delay: float = 10.0  # seconds between attempts
 
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -72,26 +81,64 @@ def parse_time(t: str) -> tuple[int, int, int]:
     return h, m, s
 
 
-def run_cec_client(cec_client_path: str, stdin_text: str, dry_run: bool = False) -> tuple[int, str, str]:
-    """Runs cec-client with the provided stdin and returns (returncode, stdout, stderr)."""
+def run_cec_client(
+    cec_client_path: str,
+    stdin_text: str,
+    dry_run: bool = False,
+    init_wait: float = 4.0,
+    settle_wait: float = 3.0,
+) -> tuple[int, str, str]:
+    """Runs cec-client with the provided stdin and returns (returncode, stdout, stderr).
+
+    Deliberately does NOT use ``-s`` (single-command) mode: after the TV has been
+    in deep standby for a few minutes, the CEC adapter needs time to re-power,
+    poll the bus and register a logical address. ``-s`` transmits before that
+    handshake finishes, so wake commands silently get dropped. Instead we start
+    cec-client normally, wait ``init_wait`` seconds for it to initialize, send the
+    command, wait ``settle_wait`` for it to be transmitted, then close stdin so
+    cec-client exits.
+    """
     LOG.debug("Will run cec-client: %s; stdin: %s", cec_client_path, stdin_text.strip())
     if dry_run:
-        print(f"DRY-RUN: {cec_client_path} -s -d 1 <<< {stdin_text!r}")
+        print(f"DRY-RUN: {cec_client_path} -d 1 <<< {stdin_text!r}")
         return 0, "", ""
 
     try:
-        p = subprocess.run([cec_client_path, "-s", "-d", "1"], input=stdin_text, text=True, capture_output=True)
-        stdout = p.stdout or ""
-        stderr = p.stderr or ""
-        LOG.debug("cec-client exited: %s", p.returncode)
-        if stdout.strip():
-            LOG.debug("cec-client stdout: %s", stdout.strip())
-        if stderr.strip():
-            LOG.debug("cec-client stderr: %s", stderr.strip())
-        return p.returncode, stdout, stderr
+        p = subprocess.Popen(
+            [cec_client_path, "-d", "1"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
     except FileNotFoundError:
         LOG.error("cec-client not found at %s", cec_client_path)
         return 127, "", ""
+
+    try:
+        time.sleep(init_wait)
+        assert p.stdin is not None
+        p.stdin.write(stdin_text)
+        p.stdin.flush()
+        time.sleep(settle_wait)
+        p.stdin.close()
+        stdout, stderr = p.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        stdout, stderr = p.communicate()
+    except Exception:
+        p.kill()
+        p.communicate()
+        raise
+
+    stdout = stdout or ""
+    stderr = stderr or ""
+    LOG.debug("cec-client exited: %s", p.returncode)
+    if stdout.strip():
+        LOG.debug("cec-client stdout: %s", stdout.strip())
+    if stderr.strip():
+        LOG.debug("cec-client stderr: %s", stderr.strip())
+    return p.returncode, stdout, stderr
 
 
 def build_stdin_for_command(cmd: str, device: str) -> str:
@@ -113,6 +160,8 @@ def schedule_commands(scheduler: BackgroundScheduler, cfg: Dict[str, Any], dry_r
         LOG.warning("No commands found in configuration")
 
     global_delay = float(cfg.get("command_delay", 1.0))
+    global_retries = int(cfg.get("retries", 0))
+    global_retry_delay = float(cfg.get("retry_delay", 10.0))
 
     for idx, item in enumerate(raw_cmds):
         # Support either 'commands' (list) or legacy 'command' (string)
@@ -134,6 +183,8 @@ def schedule_commands(scheduler: BackgroundScheduler, cfg: Dict[str, Any], dry_r
             commands=commands_list,
             days=item.get("days"),
             name=item.get("name") or (commands_list[0] if commands_list else f"cmd-{idx}"),
+            retries=int(item.get("retries", global_retries)),
+            retry_delay=float(item.get("retry_delay", global_retry_delay)),
         )
         h, m, s = parse_time(sc.time)
 
@@ -147,16 +198,22 @@ def schedule_commands(scheduler: BackgroundScheduler, cfg: Dict[str, Any], dry_r
 
         def job_wrapper(sc=sc, device=device, cec_client_path=cec_client_path, dry_run=dry_run, item_delay=item_delay):
             LOG.info("Executing scheduled job '%s' at %s (commands=%s)", sc.name, datetime.now().astimezone(), sc.commands)
+            attempts = sc.retries + 1
             for i, cmd in enumerate(sc.commands):
-                LOG.info("Starting command %d/%d: %s", i + 1, len(sc.commands), cmd)
                 stdin = build_stdin_for_command(cmd, device)
-                rc, out, err = run_cec_client(cec_client_path, stdin, dry_run=dry_run)
-                if rc == 0:
-                    LOG.info("Command '%s' triggered successfully for device %s at %s", cmd, device, datetime.now().astimezone())
-                    if out.strip():
-                        LOG.info("Command output: %s", out.strip())
-                else:
-                    LOG.warning("Command '%s' returned non-zero exit status %s; stderr: %s", cmd, rc, err.strip())
+                for attempt in range(1, attempts + 1):
+                    LOG.info("Command %d/%d: %s (attempt %d/%d)", i + 1, len(sc.commands), cmd, attempt, attempts)
+                    rc, out, err = run_cec_client(cec_client_path, stdin, dry_run=dry_run)
+                    if rc == 0:
+                        LOG.info("Command '%s' triggered successfully for device %s at %s", cmd, device, datetime.now().astimezone())
+                        if out.strip():
+                            LOG.info("Command output: %s", out.strip())
+                    else:
+                        LOG.warning("Command '%s' returned non-zero exit status %s; stderr: %s", cmd, rc, err.strip())
+
+                    if attempt < attempts and sc.retry_delay > 0:
+                        LOG.debug("Sleeping %.2fs before retry", sc.retry_delay)
+                        time.sleep(sc.retry_delay)
 
                 # Delay before the next command if applicable
                 if i < len(sc.commands) - 1 and item_delay > 0:

@@ -9,11 +9,20 @@ cec_client_path: /usr/bin/cec-client
 # Can be overridden per-item with 'command_delay'
 command_delay: 1.0
 
+# Re-send each command this many extra times, waiting 'retry_delay' seconds
+# between attempts. A TV in deep standby often ignores the first 'on' (it only
+# wakes the CEC controller); a second attempt powers the panel. Overridable
+# per-item with 'retries' / 'retry_delay'.
+retries: 0
+retry_delay: 10.0
+
 commands:
   - name: "Turn TV on"
     time: "15:00"
     commands: ["on"]
     days: [mon,tue,wed,thu,fri]
+    retries: 2          # send 'on' up to 3 times, 10s apart
+    retry_delay: 10.0
 
   - name: "Turn TV off for night"
     time: "20:00"
