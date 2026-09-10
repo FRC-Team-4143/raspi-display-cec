@@ -4,44 +4,30 @@ Schedule CEC commands (via the `cec-client` binary) to run at specific times of 
 
 ---
 
-## Quick start 💡
-
-1. Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-2. Copy `cec_schedule.example.yaml` to `cec_schedule.yaml` and edit it to match your device and desired times.
-
-3. Test (dry-run):
-
-```bash
-python3 cec_scheduler.py --config cec_schedule.yaml --dry-run
-```
-
-4. Run for real:
-
-```bash
-python3 cec_scheduler.py --config cec_schedule.yaml
-```
-
----
-
-## Configuration format
-See `cec_schedule.example.yaml` for examples. Key fields:
-
-- `device` — logical device address (e.g. `0`)
-- `cec_client_path` — optional path to the `cec-client` binary
-- `commands` — list of commands with `time`, `command`, optional `days` and optional `name`
-
-Time format: `HH:MM` or `HH:MM:SS`.
-
-Note: scheduled times in the YAML are interpreted in the system's local timezone (not UTC).
-
-Days: `mon,tue,wed,thu,fri,sat,sun` — omit to run every day.
-
-Commands: either a single `command` string (legacy) or `commands` as a list of strings. Common values are `on` and `standby`. You may also pass raw `tx` pairs like `tx 40:44:41:00`. Example: `commands: ['standby', 'tx 40:44:41:00']` will run both commands in order.
+> [!CAUTION]
+> ## ⚠️ DISABLE THE TV's DEEP SLEEP / ECO POWER SETTINGS ⚠️
+>
+> **Many TVs cut power to their HDMI-CEC controller after a short idle period
+> (e.g. the ONN TV drops CEC roughly 15 minutes after going to standby). Once
+> that happens the TV is completely deaf to CEC and _nothing this scheduler
+> sends can wake it_ — the scheduled `on` command will silently do nothing.**
+>
+> Before relying on this scheduler, go into the TV's settings and turn **off**
+> anything along these lines:
+>
+> - **"Eco" / "Energy saving" / "Power saving" standby mode**
+> - **"Deep sleep" / "Deep standby"**
+> - **"Quick start" / "Fast start" set to its low-power option** (you usually
+>   want quick-start *enabled*, which keeps CEC alive)
+> - Any "auto power off" / "sleep after N minutes" timer that fully powers the set down
+> - Vendor-branded CEC names are fine to leave **on**: *Anynet+* (Samsung),
+>   *Bravia Sync* (Sony), *SimpLink* (LG), *CEC* / *HDMI Control* (others)
+>
+> **Quick check:** put the TV in standby, wait ~20 minutes, then run
+> `echo 'pow 0' | cec-client -s -d 1` on the Pi. If it reports a power state,
+> CEC is still alive and the scheduler will work. If it times out or returns
+> `unknown`, the TV has powered down its CEC controller and you must fix the
+> settings above.
 
 ---
 
@@ -74,3 +60,24 @@ You can inspect the example unit in `cec-scheduler.service` — replace `{{INSTA
 
 Logs:
 - View logs with: `sudo journalctl -u cec-scheduler -f`
+
+---
+
+## Configuration format
+See `cec_schedule.example.yaml` for examples. Key fields:
+
+- `device` — logical device address (e.g. `0`)
+- `cec_client_path` — optional path to the `cec-client` binary
+- `commands` — list of commands with `time`, `command`, optional `days` and optional `name`
+
+Time format: `HH:MM` or `HH:MM:SS`.
+
+Note: scheduled times in the YAML are interpreted in the system's local timezone (not UTC).
+
+Days: `mon,tue,wed,thu,fri,sat,sun` — omit to run every day.
+
+Commands: either a single `command` string (legacy) or `commands` as a list of strings. Common values are `on` and `standby`. You may also pass raw `tx` pairs like `tx 40:44:41:00`. Example: `commands: ['standby', 'tx 40:44:41:00']` will run both commands in order.
+
+---
+
+
