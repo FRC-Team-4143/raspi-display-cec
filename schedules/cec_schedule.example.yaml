@@ -16,6 +16,12 @@ command_delay: 1.0
 retries: 0
 retry_delay: 10.0
 
+# Before each job, ask the TV for its CEC power state. If it doesn't answer, the
+# TV has powered down its CEC controller (deep sleep / eco standby) and is
+# offline -- the job is skipped and an error is logged recommending a settings
+# change. Set to false to send commands regardless.
+power_check: true
+
 commands:
   - name: "Turn TV on"
     time: "15:00"

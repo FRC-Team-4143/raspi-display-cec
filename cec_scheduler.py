@@ -30,6 +30,14 @@ Fields:
     Useful for waking a TV that has been in deep standby for a while.
   - retry_delay: optional float, seconds between attempts (default 10).
 
+Top-level options:
+  - command_delay: seconds between multiple commands in one item (default 1).
+  - retries / retry_delay: defaults for the per-item fields above.
+  - power_check: if true (default), query the TV's CEC power state before each
+    job and skip the job (logging an error) if the TV does not answer -- meaning
+    it has powered down its CEC controller and is offline. Set false to always
+    send commands.
+
 Note: cec-client is run WITHOUT ``-s`` and given a few seconds to initialize
 before each command, so wake commands still work after the TV has dropped off
 the CEC bus.
@@ -141,6 +149,40 @@ def run_cec_client(
     return p.returncode, stdout, stderr
 
 
+def query_power_state(cec_client_path: str, device: str, retries: int = 1, retry_delay: float = 5.0) -> str:
+    """Ask the TV for its CEC power state.
+
+    Returns one of: ``"on"``, ``"standby"``, ``"transition"`` (powering up/down)
+    or ``"unknown"``. ``"unknown"`` means the device never answered the ``pow``
+    query -- typically because the TV has powered down its HDMI-CEC controller
+    and is effectively offline to CEC.
+    """
+    attempts = max(1, retries + 1)
+    state = "unknown"
+    for attempt in range(1, attempts + 1):
+        rc, out, err = run_cec_client(cec_client_path, f"pow {device}\n", dry_run=False)
+        text = f"{out}\n{err}".lower()
+        for line in text.splitlines():
+            line = line.strip()
+            if "power status:" not in line:
+                continue
+            val = line.split("power status:", 1)[1].strip()
+            if val.startswith("on"):
+                state = "on"
+            elif "standby" in val:
+                state = "standby"
+            elif "transition" in val:
+                state = "transition"
+            else:
+                state = "unknown"
+        if state != "unknown":
+            return state
+        LOG.debug("Power state query returned 'unknown' (attempt %d/%d)", attempt, attempts)
+        if attempt < attempts and retry_delay > 0:
+            time.sleep(retry_delay)
+    return state
+
+
 def build_stdin_for_command(cmd: str, device: str) -> str:
     # Common short commands: 'on', 'standby'
     # If the command already contains the device, pass it through
@@ -162,6 +204,7 @@ def schedule_commands(scheduler: BackgroundScheduler, cfg: Dict[str, Any], dry_r
     global_delay = float(cfg.get("command_delay", 1.0))
     global_retries = int(cfg.get("retries", 0))
     global_retry_delay = float(cfg.get("retry_delay", 10.0))
+    power_check = bool(cfg.get("power_check", True))
 
     for idx, item in enumerate(raw_cmds):
         # Support either 'commands' (list) or legacy 'command' (string)
@@ -196,8 +239,24 @@ def schedule_commands(scheduler: BackgroundScheduler, cfg: Dict[str, Any], dry_r
         # Ensure the trigger uses the scheduler's timezone (local time)
         trigger = CronTrigger(hour=h, minute=m, second=s, day_of_week=day_of_week, timezone=scheduler.timezone)
 
-        def job_wrapper(sc=sc, device=device, cec_client_path=cec_client_path, dry_run=dry_run, item_delay=item_delay):
+        def job_wrapper(sc=sc, device=device, cec_client_path=cec_client_path, dry_run=dry_run,
+                        item_delay=item_delay, power_check=power_check):
             LOG.info("Executing scheduled job '%s' at %s (commands=%s)", sc.name, datetime.now().astimezone(), sc.commands)
+
+            if power_check and not dry_run:
+                state = query_power_state(cec_client_path, device)
+                if state == "unknown":
+                    LOG.error(
+                        "TV at device %s did not report a power state -- it appears to have "
+                        "gone offline (its HDMI-CEC controller has powered down). Skipping job "
+                        "'%s'. Fix: disable the TV's deep sleep / eco / low-power standby "
+                        "settings so it keeps CEC alive (see README). Set 'power_check: false' "
+                        "in the config to send commands anyway.",
+                        device, sc.name,
+                    )
+                    return
+                LOG.info("TV power state before job '%s': %s", sc.name, state)
+
             attempts = sc.retries + 1
             for i, cmd in enumerate(sc.commands):
                 stdin = build_stdin_for_command(cmd, device)

@@ -69,6 +69,8 @@ See `cec_schedule.example.yaml` for examples. Key fields:
 - `device` — logical device address (e.g. `0`)
 - `cec_client_path` — optional path to the `cec-client` binary
 - `commands` — list of commands with `time`, `command`, optional `days` and optional `name`
+- `retries` / `retry_delay` — re-send each command this many extra times, this many seconds apart (top-level default, overridable per item). Helps wake a TV that's slow to respond after standby.
+- `power_check` — default `true`. Before running a job the scheduler queries the TV's CEC power state; if the TV doesn't answer it has powered down its CEC controller (see the warning above) and the job is **skipped** with an error logged. Set to `false` to send commands regardless.
 
 Time format: `HH:MM` or `HH:MM:SS`.
 
