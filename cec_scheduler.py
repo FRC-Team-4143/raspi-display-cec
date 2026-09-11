@@ -15,6 +15,8 @@ Config format (YAML):
 
 device: 0
 cec_client_path: /usr/bin/cec-client  # optional, default: cec-client
+hdmi_port: 1                           # optional: HDMI port the Pi is plugged into
+cec_log_level: 1                       # optional: cec-client -d bitmask (8 = traffic)
 commands:
   - time: "15:00"
     command: "on"
@@ -33,6 +35,14 @@ Fields:
 Top-level options:
   - command_delay: seconds between multiple commands in one item (default 1).
   - retries / retry_delay: defaults for the per-item fields above.
+  - hdmi_port: the HDMI port number on the TV the Pi is connected to. Passed to
+    cec-client as ``-p`` so it always has a valid physical address, even when it
+    starts while the TV is asleep and cannot read EDID. Without this, Roku / ONN
+    TVs ignore the ``as`` (<Active Source>) wake frame because its address is
+    bogus. Recommended whenever waking a TV from standby.
+  - cec_log_level: cec-client ``-d`` log-level bitmask (1=ERROR, 2=WARNING,
+    4=NOTICE, 8=TRAFFIC, 16=DEBUG). Default 1. Set to 8 to log every CEC frame
+    and its ACK/NAK when diagnosing why a command had no effect.
   - power_check: if true (default), query the TV's CEC power state before each
     job and skip the job (logging an error) if the TV does not answer -- meaning
     it has powered down its CEC controller and is offline. Set false to always
@@ -132,6 +142,8 @@ def run_cec_job(
     retries: int,
     retry_delay: float,
     power_check: bool,
+    hdmi_port: Optional[str] = None,
+    cec_log_level: int = 1,
     dry_run: bool = False,
     init_wait: float = 4.0,
     settle_wait: float = 3.0,
@@ -150,16 +162,26 @@ def run_cec_job(
     ``inter_delay`` between them) holding stdin open, then wait ``settle_wait`` for
     the last frame to go out before closing stdin so cec-client exits.
     """
+    # Base cec-client argv. ``-p`` pins the adapter's physical address to the HDMI
+    # port the Pi is plugged into: without it, cec-client that starts while the TV
+    # is in standby often can't read EDID, comes up as f.f.f.f, and then its
+    # <Active Source> / power-on frames are invalid and silently ignored (this is
+    # what stops Roku/ONN TVs from waking). ``-d`` is the log-level bitmask
+    # (1=ERROR, 8=TRAFFIC); raise it to see the actual frames and ACK/NAK.
+    base_cmd = [cec_client_path, "-d", str(cec_log_level)]
+    if hdmi_port:
+        base_cmd += ["-p", str(hdmi_port)]
+
     if dry_run:
         if power_check:
-            print(f"DRY-RUN: {cec_client_path} -d 1 <<< 'pow {device}'")
+            print(f"DRY-RUN: {' '.join(base_cmd)} <<< 'pow {device}'")
         for cmd in commands:
-            print(f"DRY-RUN: {cec_client_path} -d 1 <<< {build_stdin_for_command(cmd, device)!r}")
+            print(f"DRY-RUN: {' '.join(base_cmd)} <<< {build_stdin_for_command(cmd, device)!r}")
         return
 
     try:
         p = subprocess.Popen(
-            [cec_client_path, "-d", "1"],
+            base_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -257,11 +279,11 @@ def run_cec_job(
         t_err.join(timeout=2)
         combined_out = "".join(out_lines).strip()
         combined_err = "".join(err_lines).strip()
-        LOG.debug("cec-client exited: %s", p.returncode)
+        LOG.info("cec-client exited: %s", p.returncode)
         if combined_out:
-            LOG.debug("cec-client stdout: %s", combined_out)
+            LOG.info("cec-client output:\n%s", combined_out)
         if combined_err:
-            LOG.debug("cec-client stderr: %s", combined_err)
+            LOG.info("cec-client stderr:\n%s", combined_err)
 
 
 def build_stdin_for_command(cmd: str, device: str) -> str:
@@ -286,6 +308,9 @@ def schedule_commands(scheduler: BackgroundScheduler, cfg: Dict[str, Any], dry_r
     global_retries = int(cfg.get("retries", 0))
     global_retry_delay = float(cfg.get("retry_delay", 10.0))
     power_check = bool(cfg.get("power_check", True))
+    hdmi_port = cfg.get("hdmi_port")
+    hdmi_port = str(hdmi_port) if hdmi_port not in (None, "") else None
+    cec_log_level = int(cfg.get("cec_log_level", 1))
 
     for idx, item in enumerate(raw_cmds):
         # Support either 'commands' (list) or legacy 'command' (string)
@@ -321,7 +346,8 @@ def schedule_commands(scheduler: BackgroundScheduler, cfg: Dict[str, Any], dry_r
         trigger = CronTrigger(hour=h, minute=m, second=s, day_of_week=day_of_week, timezone=scheduler.timezone)
 
         def job_wrapper(sc=sc, device=device, cec_client_path=cec_client_path, dry_run=dry_run,
-                        item_delay=item_delay, power_check=power_check):
+                        item_delay=item_delay, power_check=power_check,
+                        hdmi_port=hdmi_port, cec_log_level=cec_log_level):
             LOG.info("Executing scheduled job '%s' at %s (commands=%s)", sc.name, datetime.now().astimezone(), sc.commands)
             try:
                 run_cec_job(
@@ -332,6 +358,8 @@ def schedule_commands(scheduler: BackgroundScheduler, cfg: Dict[str, Any], dry_r
                     retries=sc.retries,
                     retry_delay=sc.retry_delay,
                     power_check=power_check,
+                    hdmi_port=hdmi_port,
+                    cec_log_level=cec_log_level,
                     dry_run=dry_run,
                 )
             except Exception:
@@ -363,7 +391,16 @@ def main():
     # Use system local timezone for scheduling (so YAML times are local time, not UTC)
     local_tz = datetime.now().astimezone().tzinfo
     LOG.info("Using local timezone for scheduling: %s", local_tz)
-    scheduler = BackgroundScheduler(timezone=local_tz)
+    scheduler = BackgroundScheduler(
+        timezone=local_tz,
+        job_defaults={
+            # Still fire a job if we're up to 30 minutes late (e.g. the host was
+            # briefly starved or the clock stepped via NTP just after the run time).
+            "misfire_grace_time": 1800,
+            # If several fire times were missed (host asleep/offline), run once.
+            "coalesce": True,
+        },
+    )
     schedule_commands(scheduler, cfg, dry_run=args.dry_run)
 
     def shutdown(signum, frame):

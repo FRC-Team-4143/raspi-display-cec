@@ -68,6 +68,8 @@ See `cec_schedule.example.yaml` for examples. Key fields:
 
 - `device` — logical device address (e.g. `0`)
 - `cec_client_path` — optional path to the `cec-client` binary
+- `hdmi_port` — optional; the HDMI port number on the TV the Pi is plugged into. Passed to `cec-client` as `-p` so it always has a valid physical address, even when it launches while the TV is asleep and can't read EDID. **Roku / ONN TVs ignore the `as` (`<Active Source>`) wake frame when its address is bogus**, so set this if wake commands aren't taking effect.
+- `cec_log_level` — optional; `cec-client` `-d` log-level bitmask (`1`=ERROR, `8`=TRAFFIC, `16`=DEBUG). Default `1`. Set to `8` to log every CEC frame and its ACK/NAK in the journal when diagnosing a command that had no effect.
 - `commands` — list of commands with `time`, `command`, optional `days` and optional `name`
 - `retries` / `retry_delay` — re-send each command this many extra times, this many seconds apart (top-level default, overridable per item). Helps wake a TV that's slow to respond after standby.
 - `power_check` — default `true`. Before running a job the scheduler queries the TV's CEC power state; if the TV doesn't answer it has powered down its CEC controller (see the warning above) and the job is **skipped** with an error logged. Set to `false` to send commands regardless.

@@ -5,6 +5,18 @@
 device: 0
 cec_client_path: /usr/bin/cec-client
 
+# HDMI port on the TV that the Pi is plugged into (1, 2, 3, ...). This pins the
+# adapter's physical address so <Active Source> ('as') frames are valid even when
+# cec-client starts while the TV is asleep and can't read EDID. Roku/ONN TVs
+# ignore an active-source frame with a bogus address, which is why 'as' silently
+# does nothing. Set this to the real port number.
+hdmi_port: 1
+
+# cec-client log level bitmask: 1=ERROR, 2=WARNING, 4=NOTICE, 8=TRAFFIC, 16=DEBUG.
+# 8 shows every frame sent/received plus ACK/NAK -- keep it here while diagnosing
+# the wake issue, drop back to 1 once it works.
+cec_log_level: 8
+
 # Default delay between multiple commands in a single schedule item (seconds).
 # Can be overridden per-item with 'command_delay'.
 command_delay: 5.0
@@ -24,14 +36,16 @@ power_check: true
 commands:
   - name: "Weekday TV on"
     time: "14:00"
-    commands: ["on 0", "as"]
+    # Roku/ONN wakes on <Active Source>, not <Image View On>; lead with 'as'.
+    commands: ["as", "on 0"]
     days: [mon,tue,wed,thu,fri]
     retries: 2
     retry_delay: 10.0
 
   - name: "Weekend TV on"
     time: "8:00"
-    commands: ["on 0", "as"]
+    # Roku/ONN wakes on <Active Source>, not <Image View On>; lead with 'as'.
+    commands: ["as", "on 0"]
     days: [sat,sun]
     retries: 2
     retry_delay: 10.0
