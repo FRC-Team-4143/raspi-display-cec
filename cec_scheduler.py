@@ -396,7 +396,7 @@ def main():
         job_defaults={
             # Still fire a job if we're up to 30 minutes late (e.g. the host was
             # briefly starved or the clock stepped via NTP just after the run time).
-            "misfire_grace_time": 1800,
+            "misfire_grace_time": 3600,
             # If several fire times were missed (host asleep/offline), run once.
             "coalesce": True,
         },
